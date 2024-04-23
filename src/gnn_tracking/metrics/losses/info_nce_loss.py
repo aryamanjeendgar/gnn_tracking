@@ -1,7 +1,3 @@
-"""
-Author: Yonglong Tian (yonglong@mit.edu)
-Date: May 07, 2020
-"""
 from __future__ import print_function
 
 import torch
@@ -12,47 +8,7 @@ from pytorch_lightning.core.mixins.hparams_mixin import HyperparametersMixin
 from torch_cluster import radius_graph
 
 from gnn_tracking.utils.graph_masks import get_good_node_mask_tensors
-
-def _hinge_loss_components(
-    *,
-    x: T,
-    att_edges: T,
-    rep_edges: T,
-    r_emb_hinge: float,
-    p_attr: float,
-    p_rep: float,
-    n_hits_oi: int,
-    normalization: str,
-) -> tuple[T, T]:
-    eps = 1e-9
-
-    dists_att = norm(x[att_edges[0]] - x[att_edges[1]], dim=-1)
-    norm_att = att_edges.shape[1] + eps
-    v_att = torch.sum(torch.pow(dists_att, p_attr)) / norm_att
-
-    dists_rep = norm(x[rep_edges[0]] - x[rep_edges[1]], dim=-1)
-    # There is no "good" way to normalize this: The naive way would be
-    # to normalize to the number of repulsive edges, but this number
-    # gets smaller and smaller as the training progresses, making the objective
-    # increasingly harder.
-    # The maximal number of edges that can be in the radius graph is proportional
-    # to the number of hits of interest, so we normalize by this number.
-    if normalization == "n_rep_edges":
-        norm_rep = rep_edges.shape[1] + eps
-    elif normalization == "n_hits_oi":
-        norm_rep = n_hits_oi + eps
-    elif normalization == "n_att_edges":
-        norm_rep = att_edges.shape[1] + eps
-    else:
-        msg = f"Normalization {normalization} not recognized."
-        raise ValueError(msg)
-    # Note: Relu necessary for p < 1
-    v_rep = (
-        torch.sum(torch.nn.functional.relu(r_emb_hinge - torch.pow(dists_rep, p_rep)))
-        / norm_rep
-    )
-
-    return v_att, v_rep
+from gnn_tracking.metrics.losses import MultiLossFct, MultiLossFctReturn
 
 def _InfoNCE_loss(
     *,
@@ -78,10 +34,10 @@ def _InfoNCE_loss(
 
     num = exp_sim_1
     denom = num + torch.sum(exp_sim_2)
-    return -torch.log(num / denom)
+    return torch.mean(-torch.log(num / denom))
 
 
-class InfoNCELoss(nn.Module, HyperparametersMixin):
+class InfoNCELoss(MultiLossFct, HyperparametersMixin):
     def __init__(self,
                 tau: float = 0.05,
                 dist_metric: str = 'l2_rbf',
@@ -89,6 +45,7 @@ class InfoNCELoss(nn.Module, HyperparametersMixin):
                 max_num_neighbors: int = 256,
                 pt_thld: float = 0.9,
                 max_eta: float = 4.0,
+                rep_oi_only: bool = True,
                 ):
         super(InfoNCELoss, self).__init__()
         self.save_hyperparameters()
@@ -125,7 +82,7 @@ class InfoNCELoss(nn.Module, HyperparametersMixin):
         eta: T,
         reconstructable: T,
         **kwargs,
-    ):
+    ) -> MultiLossFctReturn:
         if true_edge_index is None:
             msg = (
                 "True_edge_index must be given and not be None. Are you trying to use "
@@ -150,15 +107,32 @@ class InfoNCELoss(nn.Module, HyperparametersMixin):
             mask=mask,
             particle_id=particle_id,
         )
-        
-        loss = _InfoNCE_loss(
+        info_loss = _InfoNCE_loss(
             x=x,
             att_edges=att_edges,
             rep_edges=rep_edges,
             sim_func=self.hparams.dist_metric,
             tau=self.hparams.tau
         )
-        return loss
+        
+        losses = {
+            "attractive": info_loss,
+            "repulsive": 0
+        }
+        weights: dict[str, float] = {
+            "attractive": 1.0,
+            "repulsive": 0,
+        }
+        extra = {
+            "n_hits_oi": n_hits_oi,
+            "n_edges_att": att_edges.shape[1],
+            "n_edges_rep": rep_edges.shape[1],
+        }
+        return MultiLossFctReturn(
+            loss_dct=losses,
+            weight_dct=weights,
+            extra_metrics=extra,
+        )
 
 class SLw(nn.Module, HyperparametersMixin):
     def __init__(
